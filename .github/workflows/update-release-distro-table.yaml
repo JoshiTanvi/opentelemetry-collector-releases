@@ -1,0 +1,152 @@
+name: Update Release Matrix
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  update-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Generate artifact matrix from release assets
+        id: matrix
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const assets = context.payload.release.assets;
+            if (!assets || assets.length === 0) {
+              core.setOutput("html", "<p>No assets found.</p>");
+              return;
+            }
+
+            //
+            // Ignore metadata files
+            //
+            const IGNORE_EXTS = [".json", ".txt", ".sig", ".pem"];
+
+            function shouldIgnore(name) {
+              return IGNORE_EXTS.some(ext => name.endsWith(ext));
+            }
+
+            //
+            // Parse filenames:
+            //   <distro>_<version>_<os>_<arch>.<ext>
+            //
+            const matrix = {};
+            const distros = new Set();
+
+            function parseAssetName(name) {
+              if (shouldIgnore(name)) return null;
+
+              const match = name.match(/^([^_]+)_([^_]+)_([^_]+)_([^\.]+)\.(.+)$/);
+              if (!match) return null;
+
+              const [, distro, version, os, arch, ext] = match;
+              return { distro, version, os, arch, ext };
+            }
+
+            for (const a of assets) {
+              const parsed = parseAssetName(a.name);
+              if (!parsed) continue;
+
+              const key = `${parsed.os}/${parsed.arch}`;
+              distros.add(parsed.distro);
+
+              if (!matrix[key]) matrix[key] = {};
+              if (!matrix[key][parsed.distro]) matrix[key][parsed.distro] = new Set();
+
+              matrix[key][parsed.distro].add(parsed.ext);
+            }
+
+            const distroList = [...distros].sort();
+            const rows = Object.keys(matrix).sort();
+
+            //
+            // Build HTML table
+            //
+            let html = `
+              <style>
+                .artifact-table {
+                  border-collapse: collapse;
+                  width: 100%;
+                }
+                .artifact-table th, .artifact-table td {
+                  border: 1px solid #ccc;
+                  padding: 6px 10px;
+                  text-align: left;
+                }
+                .artifact-table th {
+                  background: #f2f2f2;
+                }
+              </style>
+
+              <table class="artifact-table">
+                <thead>
+                  <tr>
+                    <th>OS / Arch</th>
+            `;
+
+            for (const distro of distroList) {
+              html += `      <th>${distro}</th>\n`;
+            }
+
+            html += `    </tr>
+              </thead>
+              <tbody>
+            `;
+
+            for (const osarch of rows) {
+              html += `    <tr>\n      <td><strong>${osarch}</strong></td>\n`;
+
+              for (const distro of distroList) {
+                if (matrix[osarch][distro]) {
+                  const exts = [...matrix[osarch][distro]].join(", ");
+                  html += `      <td>${exts}</td>\n`;
+                } else {
+                  html += `      <td></td>\n`;
+                }
+              }
+
+              html += `    </tr>\n`;
+            }
+
+            html += `  </tbody>
+            </table>
+            `;
+
+            core.setOutput("html", html);
+
+      - name: Patch release notes
+        uses: actions/github-script@v7
+        with:
+          html: ${{ steps.matrix.outputs.html }}
+          script: |
+            const release = context.payload.release;
+            const release_id = release.id;
+            const existingBody = release.body || "";
+            const newHtml = core.getInput("html") || "";
+
+            const start = "<!-- auto-generated-start -->";
+            const end   = "<!-- auto-generated-end -->";
+
+            let updated;
+
+            if (existingBody.includes(start) && existingBody.includes(end)) {
+              updated = existingBody.replace(
+                new RegExp(`${start}[\\s\\S]*?${end}`),
+                `${start}\n${newHtml}\n${end}`
+              );
+            } else {
+              updated = `${existingBody}\n\n${start}\n${newHtml}\n${end}`;
+            }
+
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id,
+              body: updated
+            });
